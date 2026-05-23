@@ -1,0 +1,25 @@
+# dependencies + build output
+node_modules
+dist
+.wxt
+*.tsbuildinfo
+
+# dev artefacts
+.gh-profile
+.test-screens
+screenshots
+stats.html
+scripts
+
+# logs
+*.log
+
+# OS / editor
+.DS_Store
+.idea
+.vscode
+
+# env / secrets
+.env
+.env.local
+*.local
