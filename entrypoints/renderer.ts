@@ -44,6 +44,7 @@ export default defineUnlistedScript(() => {
               theme: msg.theme,
               comments: msg.comments,
               contents: msg.contents,
+              commits: msg.commits,
             })
           : renderTree(mount, {
               owner: msg.surface.owner,

@@ -11,7 +11,7 @@ import {
 } from '../src/surfaces';
 import { currentTheme, watchTheme } from '../src/theme';
 import { fetchDiff, fetchFileContents, fetchTreePaths, activePath } from '../src/data';
-import { extractComments } from '../src/comments';
+import { embeddedCommits, extractThreads, readViewerLogin } from '../src/comments';
 import { createToggleBar, type ToggleBar } from '../src/toggle';
 import {
   sendToRenderer, onOrchestratorMessage, readDiffStyle, writeDiffStyle,
@@ -109,9 +109,12 @@ class Orchestrator {
           diff = await fetchDiff(surface);
           this.cache.set(id, { diff, contents: cached?.contents });
         }
-        const comments = surface.kind === 'pr' ? extractComments() : [];
+        const commits = surface.kind === 'pr' ? embeddedCommits() : null;
+        const comments = surface.kind === 'pr' ? extractThreads(readViewerLogin()) : [];
         const contents = this.cache.get(id)?.contents;
-        sendToRenderer({ kind: 'diff', surface, diff, theme, comments, contents: contents ?? {} });
+        sendToRenderer({
+          kind: 'diff', surface, diff, theme, comments, contents: contents ?? {}, commits,
+        });
         // Fetch file text in the background; renderer folds it in via
         // addContents so Pierre can offer "expand unchanged" buttons.
         if (contents == null) void this.loadContents(surface, id);

@@ -6,11 +6,12 @@
 import {
   CodeView, processPatch, processFile, getFiletypeFromFileName, setLanguageOverride,
   type CodeViewItem, type CodeViewOptions, type DiffLineAnnotation, type FileDiffMetadata,
-  type SelectedLineRange,
 } from '@pierre/diffs';
 import { FileTree } from '@pierre/trees';
-import type { CommentThread, DiffStyle, FileTexts, ThemeMode } from './protocol';
+import type { CommentThread, CommitOids, DiffStyle, FileTexts, ThemeMode } from './protocol';
 import { readDiffStyle } from './protocol';
+import { readViewerLogin } from './comments';
+import { createCommentStore, renderThreadCard } from './comments-ui';
 import type { Surface } from './surfaces';
 import { surfaceId } from './surfaces';
 import { KNOWN_LANGS } from './languages';
@@ -39,7 +40,7 @@ export function renderDiff(
   mount: Element,
   data: {
     surface: Surface; diff: string; theme: ThemeMode;
-    comments: CommentThread[]; contents: FileTexts;
+    comments: CommentThread[]; contents: FileTexts; commits: CommitOids | null;
   },
 ): RenderHandle {
   const parsed = processPatch(data.diff).files;
@@ -50,9 +51,19 @@ export function renderDiff(
 
   const surfaceKey = surfaceId(data.surface);
   const viewed = loadSet(`viewed:${surfaceKey}`);
-  const drafts = loadDrafts(surfaceKey);
+  // Threads live in a flat array; mutations replace its contents and call
+  // refreshFile(byPath.get(path)) so Pierre re-renders that file's annotations.
+  const threads: CommentThread[] = [...data.comments];
   const expandedHuge = new Set<string>();
   let diffStyle: DiffStyle = readDiffStyle();
+  const viewerLogin = readViewerLogin();
+  const comments = createCommentStore({
+    threads,
+    pr: { owner: data.surface.owner, repo: data.surface.repo, number: data.surface.ref },
+    commits: data.commits,
+    viewerLogin,
+    refresh: (path) => { const f = byPath.get(path); if (f) refreshFile(f); },
+  });
 
   const outer = box('position:relative;width:100%');
   const panel = box('position:sticky;top:0;height:100dvh;display:flex;min-height:0');
@@ -65,17 +76,20 @@ export function renderDiff(
   outer.append(panel);
   mount.replaceChildren(outer);
 
-  const annotations = groupAnnotations(files, data.comments);
   const byPath = new Map(files.map((f) => [f.name, f]));
+  const known = new Set(files.map((f) => f.name));
   let version = 1;
-  const annotationsFor = (path: string): DiffLineAnnotation<CommentThread>[] => [
-    ...(annotations.get(path) ?? []),
-    ...(drafts.get(path) ?? []).map((d) => ({
-      side: (d.side === 'old' ? 'deletions' : 'additions') as 'deletions' | 'additions',
-      lineNumber: d.line,
-      metadata: draftThread(d),
-    })),
-  ];
+  const annotationsFor = (path: string): DiffLineAnnotation<CommentThread>[] =>
+    threads
+      .filter((t) => t.path === path && known.has(t.path))
+      .map((t) => ({
+        side: t.side === 'old' ? 'deletions' : 'additions',
+        lineNumber: t.line,
+        // Fresh metadata ref each refresh so Pierre's reference-equality check
+        // (`areDiffLineAnnotationsEqual`) re-runs renderAnnotation after we
+        // mutate a thread in place.
+        metadata: { ...t },
+      }));
   const itemFor = (fileDiff: FileDiffMetadata): CodeViewItem<CommentThread> => ({
     id: fileDiff.name,
     type: 'diff',
@@ -89,16 +103,16 @@ export function renderDiff(
 
   const buildOptions = (): CodeViewOptions<CommentThread> => ({
     ...codeViewOptions(data.theme, parsed.length, diffStyle),
-    renderAnnotation: (annotation) =>
-      annotation.metadata.draft
-        ? draftCard(annotation.metadata, (body) => commitDraft(annotation.metadata, body), () => removeDraft(annotation.metadata))
-        : commentCard(annotation.metadata),
+    renderAnnotation: (annotation) => renderThreadCard(annotation.metadata, comments),
     // CodeView's typing unions the file/diff callback shapes — we only ever
     // hold diff items here, so cast through to the diff-side properties.
     renderHeaderMetadata: (file) => viewedCheckbox((file as FileDiffMetadata).name),
+    // Pierre's built-in gutter "+" button — positioned in its own slot so it
+    // sits above the line numbers (a custom renderGutterUtility node ends up
+    // covered by them). Just enable + handle the click.
     enableGutterUtility: true,
     onGutterUtilityClick: (range, context) => {
-      if (context.type === 'diff') addDraft(context.item.fileDiff, range);
+      if (context.type === 'diff') comments.openDraft(context.item.fileDiff.name, range);
     },
   });
   const view = new CodeView<CommentThread>(buildOptions());
@@ -156,41 +170,6 @@ export function renderDiff(
   const refreshFile = (file: FileDiffMetadata): void => {
     version += 1;
     view.updateItem(itemFor(file));
-  };
-
-  const addDraft = (file: FileDiffMetadata, range: SelectedLineRange): void => {
-    const line = range.start;
-    const side: 'old' | 'new' = range.side === 'deletions' ? 'old' : 'new';
-    const list = drafts.get(file.name) ?? [];
-    // Don't stack drafts on the same line — just focus the existing one.
-    if (!list.some((d) => d.line === line && d.side === side)) {
-      list.push({ id: `d-${Date.now()}`, path: file.name, line, side, body: '' });
-      drafts.set(file.name, list);
-      saveDrafts(surfaceKey, drafts);
-      refreshFile(file);
-    }
-  };
-  const commitDraft = (meta: CommentThread, body: string): void => {
-    const file = byPath.get(meta.path);
-    if (!file || !meta.draft) return;
-    const trimmed = body.trim();
-    if (!trimmed) { removeDraft(meta); return; }
-    const list = drafts.get(meta.path) ?? [];
-    const draft = list.find((d) => d.id === meta.draft?.id);
-    if (!draft) return;
-    draft.body = trimmed;
-    draft.posted = true;
-    saveDrafts(surfaceKey, drafts);
-    refreshFile(file);
-  };
-  const removeDraft = (meta: CommentThread): void => {
-    const file = byPath.get(meta.path);
-    if (!file || !meta.draft) return;
-    const list = (drafts.get(meta.path) ?? []).filter((d) => d.id !== meta.draft?.id);
-    if (list.length > 0) drafts.set(meta.path, list);
-    else drafts.delete(meta.path);
-    saveDrafts(surfaceKey, drafts);
-    refreshFile(file);
   };
 
   const viewedCheckbox = (path: string): HTMLElement => {
@@ -357,25 +336,6 @@ function codeViewOptions(
 const isHugeDiff = (f: FileDiffMetadata): boolean =>
   f.additionLines.length + f.deletionLines.length > HUGE_DIFF_LINES;
 
-function groupAnnotations(
-  files: FileDiffMetadata[],
-  comments: CommentThread[],
-): Map<string, DiffLineAnnotation<CommentThread>[]> {
-  const known = new Set(files.map((f) => f.name));
-  const byFile = new Map<string, DiffLineAnnotation<CommentThread>[]>();
-  for (const comment of comments) {
-    if (!known.has(comment.path)) continue;
-    const list = byFile.get(comment.path) ?? [];
-    list.push({
-      side: comment.side === 'old' ? 'deletions' : 'additions',
-      lineNumber: comment.line,
-      metadata: comment,
-    });
-    byFile.set(comment.path, list);
-  }
-  return byFile;
-}
-
 function gitStatusOf(f: FileDiffMetadata): 'added' | 'deleted' | 'modified' | 'renamed' {
   if (f.type === 'new') return 'added';
   if (f.type === 'deleted') return 'deleted';
@@ -412,141 +372,18 @@ const lineCount = (text: string): number => {
   return n;
 };
 
-function commentCard(thread: CommentThread): HTMLElement {
-  const card = box(
-    'margin:6px 8px;border:1px solid var(--borderColor-default,#d1d9e0);border-radius:6px;' +
-      'background:var(--bgColor-default,#fff);overflow:hidden;font:13px/1.5 sans-serif',
-  );
-  const n = thread.comments.length;
-  const head = box(
-    'padding:4px 10px;font-weight:600;font-size:11px;color:var(--fgColor-muted,#59636e);' +
-      'background:var(--bgColor-muted,#f6f8fa)',
-  );
-  head.textContent = `${n} review comment${n > 1 ? 's' : ''}${thread.resolved ? ' · resolved' : ''}`;
-  card.append(head);
-  for (const comment of thread.comments) {
-    const item = box('padding:6px 10px;border-top:1px solid var(--borderColor-default,#d1d9e0)');
-    const author = box('font-weight:600;margin-bottom:2px');
-    author.textContent = comment.author;
-    const body = box('overflow-wrap:anywhere');
-    body.innerHTML = comment.bodyHtml;
-    item.append(author, body);
-    card.append(item);
-  }
-  return card;
-}
-
-function draftCard(
-  thread: CommentThread,
-  onSave: (body: string) => void,
-  onCancel: () => void,
-): HTMLElement {
-  const card = box(
-    'margin:6px 8px;border:1px solid var(--borderColor-default,#d1d9e0);border-radius:6px;' +
-      'background:var(--bgColor-default,#fff);overflow:hidden;font:13px/1.5 sans-serif',
-  );
-  const head = box(
-    'padding:4px 10px;font-weight:600;font-size:11px;color:var(--fgColor-muted,#59636e);' +
-      'background:var(--bgColor-muted,#f6f8fa);display:flex;justify-content:space-between',
-  );
-  head.append(
-    Object.assign(document.createElement('span'), { textContent: 'New comment' }),
-    Object.assign(document.createElement('span'), {
-      textContent: `${thread.side === 'old' ? 'L' : 'R'}${thread.line}`,
-    }),
-  );
-  const ta = document.createElement('textarea');
-  ta.value = thread.draft?.body ?? '';
-  ta.placeholder = 'Leave a comment';
-  ta.style.cssText =
-    'width:100%;min-height:64px;padding:8px 10px;border:0;border-bottom:1px solid ' +
-    'var(--borderColor-default,#d1d9e0);background:transparent;color:inherit;font:inherit;resize:vertical';
-  const actions = box('display:flex;justify-content:flex-end;gap:6px;padding:6px 8px');
-  const mkBtn = (text: string, accent: boolean): HTMLButtonElement => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = text;
-    b.style.cssText =
-      `padding:4px 10px;font:inherit;border-radius:6px;cursor:pointer;` +
-      (accent
-        ? 'background:var(--bgColor-accent-emphasis,#0969da);color:#fff;border:1px solid transparent'
-        : 'background:transparent;color:inherit;border:1px solid var(--borderColor-default,#d1d9e0)');
-    return b;
-  };
-  const cancelBtn = mkBtn('Cancel', false);
-  const saveBtn = mkBtn('Comment', true);
-  cancelBtn.addEventListener('click', onCancel);
-  saveBtn.addEventListener('click', () => onSave(ta.value));
-  actions.append(cancelBtn, saveBtn);
-  card.append(head, ta, actions);
-  requestAnimationFrame(() => ta.focus());
-  return card;
-}
-
-// A posted draft is shown like any other review thread; an unposted draft
-// is shown as a composer (see draftCard).
-function draftThread(d: LocalDraft): CommentThread {
-  const base = { path: d.path, line: d.line, side: d.side, resolved: false };
-  if (d.posted) {
-    return {
-      ...base,
-      comments: [{ author: viewerLogin(), bodyHtml: escapeHtml(d.body) }],
-    };
-  }
-  return { ...base, comments: [], draft: { id: d.id, body: d.body } };
-}
-
-function viewerLogin(): string {
-  const meta = document.querySelector('meta[name="user-login"]');
-  return meta?.getAttribute('content') ?? 'you';
-}
-
-function escapeHtml(s: string): string {
-  const div = document.createElement('div');
-  div.textContent = s;
-  return div.innerHTML.replace(/\n/g, '<br>');
-}
-
-interface LocalDraft {
-  id: string; path: string; line: number; side: 'old' | 'new'; body: string;
-  posted?: boolean;
-}
+// ───────────── Storage helpers (viewed checkboxes, tree) ─────────────
 
 const STORAGE_PREFIX = 'gh-pierre:';
-
 function loadSet(key: string): Set<string> {
   try {
     const raw = localStorage.getItem(`${STORAGE_PREFIX}${key}`);
     const parsed: unknown = raw ? JSON.parse(raw) : [];
     return new Set(Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : []);
-  } catch {
-    return new Set();
-  }
+  } catch { return new Set(); }
 }
 const saveSet = (key: string, set: Set<string>): void => {
   try { localStorage.setItem(`${STORAGE_PREFIX}${key}`, JSON.stringify([...set])); } catch { /**/ }
-};
-
-function loadDrafts(surfaceKey: string): Map<string, LocalDraft[]> {
-  const out = new Map<string, LocalDraft[]>();
-  try {
-    const raw = localStorage.getItem(`${STORAGE_PREFIX}drafts:${surfaceKey}`);
-    const parsed = raw ? (JSON.parse(raw) as LocalDraft[]) : [];
-    if (!Array.isArray(parsed)) return out;
-    for (const d of parsed) {
-      const list = out.get(d.path) ?? [];
-      list.push(d);
-      out.set(d.path, list);
-    }
-  } catch { /**/ }
-  return out;
-}
-const saveDrafts = (surfaceKey: string, drafts: Map<string, LocalDraft[]>): void => {
-  const flat: LocalDraft[] = [];
-  for (const list of drafts.values()) flat.push(...list);
-  try {
-    localStorage.setItem(`${STORAGE_PREFIX}drafts:${surfaceKey}`, JSON.stringify(flat));
-  } catch { /**/ }
 };
 
 // Code-browser tree state is kept in sessionStorage so folder expansion
@@ -589,7 +426,7 @@ function currentBranch(): string {
   return m?.[1] ?? 'HEAD';
 }
 
-function box(css: string): HTMLDivElement {
+export function box(css: string): HTMLDivElement {
   const el = document.createElement('div');
   el.style.cssText = css;
   return el;
