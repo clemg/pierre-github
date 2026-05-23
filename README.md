@@ -15,3 +15,7 @@ unified/split toggle, Pierre/Github view, per-file "Viewed" to collapse, inline
 comments, line selection, GitHub light/dark theme, large PR support
 
 **Build.** Requires [Bun](https://bun.sh): `bun install && bun run build` → `dist/chrome-mv3`. Firefox: `bun run build:firefox`.
+
+**Video demo**
+
+https://github.com/user-attachments/assets/5b2acdd3-94e4-4406-acf8-36993558766a
